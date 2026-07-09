@@ -1086,10 +1086,33 @@ async function init() {
     return report;
   }
 
+  // [intel-xe spike] read back the rigid-body state, so we can see whether the
+  // CARD diverges (omega->o_max spin, theta runaway, tz garbage) before or
+  // after the fluid, and whether any field is NaN. Poll it e.g.:
+  //   setInterval(async()=>console.log(await window.__AMR.getCardState()), 500)
+  let _cardStaging = null;
+  async function getCardState() {
+    if (!_cardStaging) _cardStaging = device.createBuffer({ size: 104, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(cardStateBuf, 0, _cardStaging, 0, 104);
+    device.queue.submit([enc.finish()]);
+    await _cardStaging.mapAsync(GPUMapMode.READ);
+    const s = new Float32Array(_cardStaging.getMappedRange()).slice();
+    _cardStaging.unmap();
+    return {
+      step,
+      theta: s[2], vx: s[3], vy: s[4], omega: s[5],
+      fx: s[6], fy: s[7], tz: s[8],
+      v_max: s[14], o_max: s[15], x_total: s[21], y_total: s[20],
+      anyNaN: [2, 3, 4, 5, 6, 7, 8, 20, 21].some(i => !Number.isFinite(s[i])),
+    };
+  }
+
   window.__AMR = {
     setLive: (v) => { liveMode = !!v; },
     isLive: () => liveMode,
     reset: resetSim,
+    getCardState,
     checkPool,
     health,
     getStep: () => step,
