@@ -403,6 +403,10 @@ async function init() {
   ]});
 
   const constants = { W, H };
+  // [intel-xe spike] coarse-step robustness net; ?safeCollide=1 enables it.
+  const SAFE_COLLIDE = urlParams.get('safeCollide') === '1' ? 1 : 0;
+  const stepConstants = { W, H, SAFE_COLLIDE };
+  if (SAFE_COLLIDE) console.log('[amr-spike] SAFE_COLLIDE=1 (coarse-step rho floor + |u| clamp active)');
   const fineConstants = { W, H, RB };
   // GHOST_ONLY=1: steady-state ghost-only reinterpolation (every macro-step).
   // GHOST_ONLY=0: full-slot fill, used once on block activation (see debugActivateBlock).
@@ -417,7 +421,7 @@ async function init() {
 
   const stepPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [stepBGL] }),
-    compute: { module: stepSM, entryPoint: 'main', constants }
+    compute: { module: stepSM, entryPoint: 'main', constants: stepConstants }
   });
   const frcPL = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [frcBGL] }),

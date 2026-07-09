@@ -54,6 +54,12 @@ struct CardState {
 
 override W : u32;
 override H : u32;
+// [intel-xe spike] robustness net (?safeCollide=1). Off => byte-identical to
+// before. On => floor rho before dividing and cap |u| below the LBM Mach
+// limit, so a single fp-tipped cell (Gen12LP rounding differs from NVIDIA at
+// this near-omega=2 relaxation) cannot cascade to a full blow-up. Only engages
+// on already-pathological cells, so the stable regime is unaffected.
+override SAFE_COLLIDE : u32 = 0u;
 const BLOCK = 8u;
 
 const ex = array<i32,9>( 0, 1, 0,-1, 0, 1,-1,-1, 1);
@@ -121,6 +127,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
   ux_star /= rho; uy_star /= rho;
 
+  var rhoDiv = rho;
+  if (SAFE_COLLIDE != 0u) {
+    // Floor density before it is used as a divisor below; recompute u* on the
+    // floored value so a near-zero/negative rho can't produce Inf velocities.
+    rhoDiv = max(rho, 1e-3f);
+    ux_star = (ux_star * rho) / rhoDiv;
+    uy_star = (uy_star * rho) / rhoDiv;
+  }
+
   // 3. Penalty Force and Solid Coupling (window-space)
   let p = vec2<f32>(f32(wx), f32(wy));
   var rx = p.x - state.cx;
@@ -139,8 +154,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let Fy = rho * chi * (usy - uy_star);
 
   // Actual fluid velocity u = u* + F/(2rho)
-  let ux = ux_star + Fx / (2.0f * rho);
-  let uy = uy_star + Fy / (2.0f * rho);
+  var ux = ux_star + Fx / (2.0f * rhoDiv);
+  var uy = uy_star + Fy / (2.0f * rhoDiv);
+  if (SAFE_COLLIDE != 0u) {
+    // Cap |u| below the LBM Mach limit -- keeps feq's (1 - 1.5*u_sq) term from
+    // going negative and driving populations negative. 0.35 is well above any
+    // physical velocity in the stable regime (author's run: |vy|~0.02), so
+    // this is inert until a cell is already diverging.
+    let UMAX = 0.35f;
+    let m2 = ux*ux + uy*uy;
+    if (m2 > UMAX*UMAX) { let s = UMAX * inverseSqrt(m2); ux = ux * s; uy = uy * s; }
+  }
   let u_sq = ux*ux + uy*uy;
 
   // Store velocity for rendering (block-major buffer cell index)
