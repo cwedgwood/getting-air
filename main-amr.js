@@ -1066,7 +1066,7 @@ async function init() {
   // instability" becomes a number and E3 can locate the first bad step.
   //   await window.__AMR.health()
   let _healthStaging = null;
-  async function health() {
+  async function health(quiet) {
     if (!_healthStaging) _healthStaging = device.createBuffer({ size: NCELLS * 2 * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     const enc = device.createCommandEncoder();
     enc.copyBufferToBuffer(velBuf, 0, _healthStaging, 0, NCELLS * 2 * 4);
@@ -1082,7 +1082,7 @@ async function init() {
       const a = Math.abs(x); if (a > maxAbs) maxAbs = a;
     }
     const report = { step, nan, inf, maxAbsVel: maxAbs, healthy: nan === 0 && inf === 0 };
-    console[report.healthy ? 'log' : 'error']('[amr-spike] health', report);
+    if (!quiet) console[report.healthy ? 'log' : 'error']('[amr-spike] health', report);
     return report;
   }
 
@@ -1132,6 +1132,31 @@ async function init() {
     getBlockGridDims: () => ({ NBX, NBY, RB, MAX_FINE_BLOCKS }),
     getRefineParams: () => ({ REFINE_EVERY, REFINE_THRESH, COARSEN_THRESH }),
   };
+
+  // [intel-xe spike] ?trace=1 : auto-sample card + fluid health from page load
+  // (no manual timing) and dump the ramp as JSON the instant the fluid first
+  // NaNs, so we can see whether the fluid or the card diverges first. JSON so
+  // it copy-pastes as text (console.table does not).
+  if (urlParams.get('trace') === '1') {
+    const traceLog = [];
+    let traceDone = false;
+    const traceTimer = setInterval(async () => {
+      if (traceDone) return;
+      try {
+        const c = await getCardState();
+        const h = await health(true);
+        traceLog.push({ step: c.step, omega: +c.omega.toFixed(5), theta: +c.theta.toFixed(2), tz: +c.tz.toExponential(2), fy: +c.fy.toExponential(2), vy: +c.vy.toFixed(4), nan: h.nan, maxU: +h.maxAbsVel.toExponential(3) });
+        if (h.nan > 0) {
+          traceDone = true;
+          clearInterval(traceTimer);
+          const tail = traceLog.slice(-40);
+          console.warn('[amr-spike] TRACE first NaN at step', c.step, '-- copy the JSON below:');
+          console.log('AMR_TRACE_JSON ' + JSON.stringify(tail));
+        }
+      } catch (e) { /* readback can race a lost device; ignore */ }
+    }, 50);
+    console.log('[amr-spike] trace=1 armed (auto-dumps JSON at first NaN)');
+  }
 
   async function frame() {
     try {
