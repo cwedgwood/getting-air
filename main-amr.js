@@ -534,7 +534,11 @@ async function init() {
   const WGX1 = Math.ceil(FB / 8), WGY1 = Math.ceil(FB / 8);
   // Milestone 4b: manage dispatches one thread per coarse block.
   const WG_MANAGE = Math.ceil(NBLOCKS / 64);
-  const STEPS_PER_FRAME = 64;
+  // [intel-xe spike] ?stepsPerFrame=N slows wall-clock (identical physics, just
+  // fewer macro-steps batched per frame) so the trace sampler can resolve the
+  // onset. Default 64. (debugStepSync's even-batch snapshot invariant assumes
+  // 64; only override for live tracing, not snapshot work.)
+  const STEPS_PER_FRAME = Math.max(1, parseInt(urlParams.get('stepsPerFrame')) || 64);
   let step = 0, lastT = performance.now();
   let useB = false;
   let liveMode = true;
