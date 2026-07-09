@@ -51,6 +51,9 @@ const NBX = W / BLOCK, NBY = H / BLOCK, NBLOCKS = NBX * NBY; // coarse block gri
 const REFINE_EVERY = urlParams.has('refineEvery') ? parseInt(urlParams.get('refineEvery')) : 16;
 const REFINE_THRESH = urlParams.has('refineThresh') ? parseFloat(urlParams.get('refineThresh')) : -6;
 const COARSEN_THRESH = urlParams.has('coarsenThresh') ? parseFloat(urlParams.get('coarsenThresh')) : -7;
+// [intel-xe spike] E1 discriminator: ?autoRefine=0 starts with refinement OFF
+// so the AMR pool/management path is bypassed, isolating the coarse solver.
+const INITIAL_AUTOREFINE = urlParams.get('autoRefine') !== '0';
 
 const resSlider = document.getElementById('slider-RES');
 const resVal    = document.getElementById('val-RES');
@@ -208,6 +211,19 @@ async function init() {
     requiredFeatures: hasTimestamp ? ['timestamp-query'] : [],
     requiredLimits,
   });
+
+  // [intel-xe spike] E0 diagnostics: dump adapter identity + the limits that
+  // matter for the res>128 investigation, and surface a silent device loss.
+  try {
+    const info = adapter.info || {};
+    console.log('[amr-spike] adapter.info', { vendor: info.vendor, architecture: info.architecture, device: info.device, description: info.description });
+    const limKeys = ['maxStorageBufferBindingSize', 'maxBufferSize', 'maxComputeWorkgroupStorageSize', 'maxComputeInvocationsPerWorkgroup', 'maxComputeWorkgroupsPerDimension', 'maxStorageBuffersPerShaderStage'];
+    console.log('[amr-spike] adapter.limits', Object.fromEntries(limKeys.map(k => [k, adapter.limits[k]])));
+    console.log('[amr-spike] granted device.limits', Object.fromEntries(['maxStorageBufferBindingSize', 'maxBufferSize'].map(k => [k, device.limits[k]])));
+    console.log('[amr-spike] sizing', { W, H, NCELLS, NBX, NBY, NBLOCKS, MAX_FINE_BLOCKS, neededBufferBytes, initialAutoRefine: INITIAL_AUTOREFINE });
+  } catch (e) { console.warn('[amr-spike] E0 diagnostics failed', e); }
+  device.lost.then(info => console.error('[amr-spike] DEVICE LOST:', info.reason, info.message));
+  device.addEventListener('uncapturederror', (e) => console.error('[amr-spike] uncapturederror:', e.error));
 
   const querySet = hasTimestamp ? device.createQuerySet({
     type: 'timestamp',
@@ -518,7 +534,7 @@ async function init() {
   let step = 0, lastT = performance.now();
   let useB = false;
   let liveMode = true;
-  let autoRefine = true; // Milestone 4b: on by default so refinement (and its coverage overlay) is visible without a console command; setAutoRefine(false) to disable for manual debugActivateBlock/debugDeactivateBlock testing
+  let autoRefine = INITIAL_AUTOREFINE; // Milestone 4b: on by default so refinement (and its coverage overlay) is visible without a console command; setAutoRefine(false) to disable for manual debugActivateBlock/debugDeactivateBlock testing. [intel-xe spike] initial value honors ?autoRefine=0.
   let macroStepCounter = 0;
 
   const trajectory = [];
@@ -758,7 +774,7 @@ async function init() {
     freeSlots = Array.from({ length: MAX_FINE_BLOCKS }, (_, i) => i);
     device.queue.writeBuffer(freeListBuf, 0, new Int32Array(MAX_FINE_BLOCKS).map((_, i) => i));
     device.queue.writeBuffer(freeCountBuf, 0, new Int32Array([MAX_FINE_BLOCKS]));
-    autoRefine = true; // matches the on-by-default initial state -- reset shouldn't silently disable it
+    autoRefine = INITIAL_AUTOREFINE; // matches the initial state -- reset shouldn't silently flip it ([intel-xe spike] honors ?autoRefine=0)
     macroStepCounter = 0;
     useB = false;
     step = 0;
@@ -1009,10 +1025,69 @@ async function init() {
     return { step };
   }
 
+  // [intel-xe spike] E2 smoking-gun test for the pool free-list race (H1):
+  // read back blockSlot + slotToBlock and verify they are consistent mutual
+  // inverses. Any duplicate-slot or inverse-mismatch => the fine-block pool
+  // allocator (amr_manage.wgsl) corrupted the mapping, which is the "allocation
+  // problem" candidate. Run after letting a res=8 sim churn on the failing GPU:
+  //   await window.__AMR.checkPool()
+  async function checkPool() {
+    const { blockSlot, slotToBlock } = await readPoolIndirection();
+    const conflicts = [];
+    const slotOwner = new Map();
+    let activeBlocks = 0;
+    for (let b = 0; b < blockSlot.length; b++) {
+      const s = blockSlot[b];
+      if (s < 0) continue;
+      activeBlocks++;
+      if (s >= slotToBlock.length) { conflicts.push({ type: 'slot-out-of-range', block: b, slot: s }); continue; }
+      if (slotToBlock[s] !== b) conflicts.push({ type: 'inverse-mismatch', block: b, slot: s, slotToBlock_says: slotToBlock[s] });
+      if (slotOwner.has(s)) conflicts.push({ type: 'duplicate-slot', slot: s, blocks: [slotOwner.get(s), b] });
+      else slotOwner.set(s, b);
+    }
+    let activeSlots = 0;
+    for (let s = 0; s < slotToBlock.length; s++) {
+      const b = slotToBlock[s];
+      if (b < 0) continue;
+      activeSlots++;
+      if (b >= blockSlot.length || blockSlot[b] !== s) conflicts.push({ type: 'reverse-mismatch', slot: s, block: b, blockSlot_says: (b < blockSlot.length ? blockSlot[b] : 'oob') });
+    }
+    const report = { ok: conflicts.length === 0, step, activeBlocks, activeSlots, conflicts };
+    console[report.ok ? 'log' : 'error']('[amr-spike] checkPool', report);
+    return report;
+  }
+
+  // [intel-xe spike] instability quantifier: scan the coarse velocity buffer
+  // for NaN/Inf and report magnitude extremes, so "behaves differently /
+  // instability" becomes a number and E3 can locate the first bad step.
+  //   await window.__AMR.health()
+  let _healthStaging = null;
+  async function health() {
+    if (!_healthStaging) _healthStaging = device.createBuffer({ size: NCELLS * 2 * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(velBuf, 0, _healthStaging, 0, NCELLS * 2 * 4);
+    device.queue.submit([enc.finish()]);
+    await _healthStaging.mapAsync(GPUMapMode.READ);
+    const v = new Float32Array(_healthStaging.getMappedRange()).slice();
+    _healthStaging.unmap();
+    let nan = 0, inf = 0, maxAbs = 0;
+    for (let i = 0; i < v.length; i++) {
+      const x = v[i];
+      if (Number.isNaN(x)) { nan++; continue; }
+      if (!Number.isFinite(x)) { inf++; continue; }
+      const a = Math.abs(x); if (a > maxAbs) maxAbs = a;
+    }
+    const report = { step, nan, inf, maxAbsVel: maxAbs, healthy: nan === 0 && inf === 0 };
+    console[report.healthy ? 'log' : 'error']('[amr-spike] health', report);
+    return report;
+  }
+
   window.__AMR = {
     setLive: (v) => { liveMode = !!v; },
     isLive: () => liveMode,
     reset: resetSim,
+    checkPool,
+    health,
     getStep: () => step,
     getDims: () => ({ W, H }),
     debugSnapshotSave,
