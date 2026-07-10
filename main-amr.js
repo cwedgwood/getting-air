@@ -1148,7 +1148,7 @@ async function init() {
   // consistent single-step snapshot (earlier sequential reads drifted across
   // steps). Binary Float32 body; tag+step in the query string.
   async function postState(tag) {
-    tag = tag || 'state';
+    tag = (urlParams.get('label') ? urlParams.get('label') + '-' : '') + (tag || 'state');
     const sVel = device.createBuffer({ size: NCELLS * 2 * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     const sFa = device.createBuffer({ size: fSize, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     const sFb = device.createBuffer({ size: fSize, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
