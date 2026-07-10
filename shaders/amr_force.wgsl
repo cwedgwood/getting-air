@@ -70,7 +70,10 @@ fn get_phi(p: vec2<f32>, state: CardState) -> f32 {
 
 fn get_chi(phi: f32) -> f32 {
     let epsilon = 1.5f;
-    return 0.5f * (1.0f - tanh(phi / epsilon));
+    // [intel-xe fix] clamp tanh arg: Intel Gen12LP tanh() overflows to NaN for
+    // large |arg| (exp overflow -> Inf/Inf); the sigmoid is fully saturated by
+    // +/-10 so this is numerically identical in the valid regime but never NaNs.
+    return 0.5f * (1.0f - tanh(clamp(phi / epsilon, -20.0f, 20.0f)));
 }
 
 var<workgroup> wg_fx : array<f32, 64>;
