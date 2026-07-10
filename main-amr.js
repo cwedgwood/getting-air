@@ -1142,12 +1142,34 @@ async function init() {
     return { step, count, bbox: count ? [minX, minY, maxX, maxY] : null, edgeBand, interior, grid };
   }
 
+  // [intel-xe spike] ship raw GPU buffers back to the dev server (POST /collect)
+  // so the sandbox can compute rho/u at the corner cells and pinpoint the exact
+  // NaN-producing op. Binary Float32 body; tag+step in the query string.
+  async function postBuf(srcBuf, byteLen, tag) {
+    const staging = device.createBuffer({ size: byteLen, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(srcBuf, 0, staging, 0, byteLen);
+    device.queue.submit([enc.finish()]);
+    await staging.mapAsync(GPUMapMode.READ);
+    const bytes = staging.getMappedRange().slice(0);
+    staging.unmap(); staging.destroy();
+    await fetch(`/collect?tag=${tag}&step=${step}&w=${W}&h=${H}`, { method: 'POST', body: bytes });
+    console.log('[amr-spike] posted', tag, byteLen, 'bytes @ step', step);
+  }
+  async function postState(tag) {
+    tag = tag || 'state';
+    await postBuf(velBuf, NCELLS * 2 * 4, tag + '-vel');
+    await postBuf(f_a, fSize, tag + '-fa');
+    await postBuf(f_b, fSize, tag + '-fb');
+  }
+
   window.__AMR = {
     setLive: (v) => { liveMode = !!v; },
     isLive: () => liveMode,
     reset: resetSim,
     getCardState,
     nanMap,
+    postState,
     checkPool,
     health,
     getStep: () => step,
@@ -1189,6 +1211,7 @@ async function init() {
           console.warn('[amr-spike] TRACE first NaN at step', c.step, '-- copy BOTH JSON lines below:');
           console.log('AMR_TRACE_JSON ' + JSON.stringify(tail));
           console.log('AMR_NANMAP_JSON ' + JSON.stringify(map));
+          if (urlParams.get('post') === '1') { try { await postState('firstnan'); console.warn('[amr-spike] posted first-NaN state to /collect'); } catch (e) { console.error('[amr-spike] postState failed', e); } }
         }
       } catch (e) { /* readback can race a lost device; ignore */ }
     }, 50);
