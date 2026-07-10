@@ -1144,23 +1144,32 @@ async function init() {
 
   // [intel-xe spike] ship raw GPU buffers back to the dev server (POST /collect)
   // so the sandbox can compute rho/u at the corner cells and pinpoint the exact
-  // NaN-producing op. Binary Float32 body; tag+step in the query string.
-  async function postBuf(srcBuf, byteLen, tag) {
-    const staging = device.createBuffer({ size: byteLen, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
-    const enc = device.createCommandEncoder();
-    enc.copyBufferToBuffer(srcBuf, 0, staging, 0, byteLen);
-    device.queue.submit([enc.finish()]);
-    await staging.mapAsync(GPUMapMode.READ);
-    const bytes = staging.getMappedRange().slice(0);
-    staging.unmap(); staging.destroy();
-    await fetch(`/collect?tag=${tag}&step=${step}&w=${W}&h=${H}`, { method: 'POST', body: bytes });
-    console.log('[amr-spike] posted', tag, byteLen, 'bytes @ step', step);
-  }
+  // NaN-producing op. All three buffers are copied in ONE encoder so they are a
+  // consistent single-step snapshot (earlier sequential reads drifted across
+  // steps). Binary Float32 body; tag+step in the query string.
   async function postState(tag) {
     tag = tag || 'state';
-    await postBuf(velBuf, NCELLS * 2 * 4, tag + '-vel');
-    await postBuf(f_a, fSize, tag + '-fa');
-    await postBuf(f_b, fSize, tag + '-fb');
+    const sVel = device.createBuffer({ size: NCELLS * 2 * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const sFa = device.createBuffer({ size: fSize, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const sFb = device.createBuffer({ size: fSize, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(velBuf, 0, sVel, 0, NCELLS * 2 * 4);
+    enc.copyBufferToBuffer(f_a, 0, sFa, 0, fSize);
+    enc.copyBufferToBuffer(f_b, 0, sFb, 0, fSize);
+    device.queue.submit([enc.finish()]);
+    const capturedStep = step;
+    await Promise.all([sVel.mapAsync(GPUMapMode.READ), sFa.mapAsync(GPUMapMode.READ), sFb.mapAsync(GPUMapMode.READ)]);
+    const velB = sVel.getMappedRange().slice(0);
+    const faB = sFa.getMappedRange().slice(0);
+    const fbB = sFb.getMappedRange().slice(0);
+    sVel.unmap(); sFa.unmap(); sFb.unmap(); sVel.destroy(); sFa.destroy(); sFb.destroy();
+    const q = `&step=${capturedStep}&w=${W}&h=${H}`;
+    await Promise.all([
+      fetch(`/collect?tag=${tag}-vel${q}`, { method: 'POST', body: velB }),
+      fetch(`/collect?tag=${tag}-fa${q}`, { method: 'POST', body: faB }),
+      fetch(`/collect?tag=${tag}-fb${q}`, { method: 'POST', body: fbB }),
+    ]);
+    console.log('[amr-spike] posted', tag, '@ step', capturedStep);
   }
 
   window.__AMR = {
@@ -1218,6 +1227,11 @@ async function init() {
     console.log('[amr-spike] trace=1 armed (auto-dumps JSON at first NaN)');
   }
 
+  // [intel-xe spike] ?postSeq=K state (see the frame loop).
+  let _postSeqN = parseInt(urlParams.get('postSeq')) || 0;
+  let _postSeqLast = -1;
+  if (_postSeqN > 0) console.log('[amr-spike] postSeq armed for first', _postSeqN, 'steps');
+
   async function frame() {
     try {
       if (!liveMode) {
@@ -1260,6 +1274,15 @@ async function init() {
       const tSubmit = performance.now();
       device.queue.submit([enc.finish()]);
       device.popErrorScope().then(err => { if (err) handleErr(err); });
+
+      // [intel-xe spike] ?postSeq=K : after each of the first K macro-steps,
+      // ship vel+f_a+f_b to /collect so the sandbox can watch the corners go
+      // from healthy to the exact step they break (fire-and-forget; the state
+      // just submitted above is what gets read back).
+      if (_postSeqN > 0 && step <= _postSeqN && step !== _postSeqLast) {
+        _postSeqLast = step;
+        postState('seq' + String(step).padStart(3, '0')).catch(e => console.error('[amr-spike] seq post failed', e));
+      }
 
       stage.inFlight = true;
       stage.step = step;
