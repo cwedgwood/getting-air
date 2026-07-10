@@ -51,6 +51,9 @@ struct CardState {
 @group(0) @binding(1) var<storage, read>       f_in  : array<f32>;
 @group(0) @binding(2) var<storage, read_write> f_out : array<f32>;
 @group(0) @binding(3) var<storage, read_write> vel   : array<f32>;
+// [intel-xe spike] per-cell diagnostics (8 f32/cell): rho,ux_star,uy_star,
+// u_sq,chi,phi,sponge_weight,Fy -- to see which intermediate first goes NaN.
+@group(0) @binding(4) var<storage, read_write> dbg   : array<f32>;
 
 override W : u32;
 override H : u32;
@@ -177,6 +180,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let dist_y = min(f32(wy), f32(H - 1u - wy));
   var sponge_weight = clamp(1.0f - min(dist_x, dist_y) / SPONGE_W, 0.0f, 1.0f);
   sponge_weight = sponge_weight * sponge_weight * (3.0f - 2.0f * sponge_weight);
+
+  // [intel-xe spike] emit per-cell diagnostics.
+  let dc = cell * 8u;
+  dbg[dc + 0u] = rho;
+  dbg[dc + 1u] = ux_star;
+  dbg[dc + 2u] = uy_star;
+  dbg[dc + 3u] = u_sq;
+  dbg[dc + 4u] = chi;
+  dbg[dc + 5u] = phi;
+  dbg[dc + 6u] = sponge_weight;
+  dbg[dc + 7u] = Fy;
 
   let omg = 1.0f / state.tau;
   for (var i = 0u; i < 9u; i++) {

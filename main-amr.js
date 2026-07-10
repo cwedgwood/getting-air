@@ -351,7 +351,8 @@ async function init() {
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
   ]});
   const frcBGL = device.createBindGroupLayout({ label: 'frcBGL', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
@@ -488,8 +489,9 @@ async function init() {
     compute: { module: manageSM, entryPoint: 'refine', constants: manageConstants }
   });
 
-  const stepBG_ab = device.createBindGroup({ layout: stepBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: f_b } }, { binding: 3, resource: { buffer: velBuf } }]});
-  const stepBG_ba = device.createBindGroup({ layout: stepBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: f_a } }, { binding: 3, resource: { buffer: velBuf } }]});
+  const dbgStepBuf = device.createBuffer({ size: NCELLS * 8 * 4, usage: U.STORAGE | U.COPY_SRC });
+  const stepBG_ab = device.createBindGroup({ layout: stepBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: f_b } }, { binding: 3, resource: { buffer: velBuf } }, { binding: 4, resource: { buffer: dbgStepBuf } }]});
+  const stepBG_ba = device.createBindGroup({ layout: stepBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: f_a } }, { binding: 3, resource: { buffer: velBuf } }, { binding: 4, resource: { buffer: dbgStepBuf } }]});
 
   const frcBG_a = device.createBindGroup({ layout: frcBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_a } }, { binding: 2, resource: { buffer: forceBuf } }]});
   const frcBG_b = device.createBindGroup({ layout: frcBGL, entries: [{ binding: 0, resource: { buffer: cardStateBuf } }, { binding: 1, resource: { buffer: f_b } }, { binding: 2, resource: { buffer: forceBuf } }]});
@@ -1161,22 +1163,26 @@ async function init() {
     const sVel = device.createBuffer({ size: NCELLS * 2 * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     const sFa = device.createBuffer({ size: fSize, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     const sFb = device.createBuffer({ size: fSize, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const sDbg = device.createBuffer({ size: NCELLS * 8 * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     const enc = device.createCommandEncoder();
     enc.copyBufferToBuffer(velBuf, 0, sVel, 0, NCELLS * 2 * 4);
     enc.copyBufferToBuffer(f_a, 0, sFa, 0, fSize);
     enc.copyBufferToBuffer(f_b, 0, sFb, 0, fSize);
+    enc.copyBufferToBuffer(dbgStepBuf, 0, sDbg, 0, NCELLS * 8 * 4);
     device.queue.submit([enc.finish()]);
     const capturedStep = step;
-    await Promise.all([sVel.mapAsync(GPUMapMode.READ), sFa.mapAsync(GPUMapMode.READ), sFb.mapAsync(GPUMapMode.READ)]);
+    await Promise.all([sVel.mapAsync(GPUMapMode.READ), sFa.mapAsync(GPUMapMode.READ), sFb.mapAsync(GPUMapMode.READ), sDbg.mapAsync(GPUMapMode.READ)]);
     const velB = sVel.getMappedRange().slice(0);
     const faB = sFa.getMappedRange().slice(0);
     const fbB = sFb.getMappedRange().slice(0);
-    sVel.unmap(); sFa.unmap(); sFb.unmap(); sVel.destroy(); sFa.destroy(); sFb.destroy();
+    const dbgB = sDbg.getMappedRange().slice(0);
+    sVel.unmap(); sFa.unmap(); sFb.unmap(); sDbg.unmap(); sVel.destroy(); sFa.destroy(); sFb.destroy(); sDbg.destroy();
     const q = `&step=${capturedStep}&w=${W}&h=${H}`;
     await Promise.all([
       fetch(`/collect?tag=${tag}-vel${q}`, { method: 'POST', body: velB }),
       fetch(`/collect?tag=${tag}-fa${q}`, { method: 'POST', body: faB }),
       fetch(`/collect?tag=${tag}-fb${q}`, { method: 'POST', body: fbB }),
+      fetch(`/collect?tag=${tag}-dbg${q}`, { method: 'POST', body: dbgB }),
     ]);
     console.log('[amr-spike] posted', tag, '@ step', capturedStep);
   }
