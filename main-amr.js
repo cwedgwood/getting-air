@@ -1112,11 +1112,42 @@ async function init() {
     };
   }
 
+  // [intel-xe spike] locate NaN velocity cells in space (inverting the
+  // block-major cellIndex layout the coarse step writes vel[] in), to see
+  // whether they start at the domain edge, block edges, a corner, or the card.
+  async function nanMap() {
+    if (!_healthStaging) _healthStaging = device.createBuffer({ size: NCELLS * 2 * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(velBuf, 0, _healthStaging, 0, NCELLS * 2 * 4);
+    device.queue.submit([enc.finish()]);
+    await _healthStaging.mapAsync(GPUMapMode.READ);
+    const v = new Float32Array(_healthStaging.getMappedRange()).slice();
+    _healthStaging.unmap();
+    const nbx = W / 8;
+    let count = 0, minX = 1e9, minY = 1e9, maxX = -1, maxY = -1, edgeBand = 0, interior = 0;
+    const G = 8; // GxG spatial histogram
+    const grid = Array.from({ length: G }, () => new Array(G).fill(0));
+    for (let cell = 0; cell < NCELLS; cell++) {
+      if (Number.isNaN(v[cell * 2]) || Number.isNaN(v[cell * 2 + 1])) {
+        const blockID = Math.floor(cell / 64), local = cell % 64;
+        const x = (blockID % nbx) * 8 + (local % 8);
+        const y = Math.floor(blockID / nbx) * 8 + Math.floor(local / 8);
+        count++;
+        if (x < minX) minX = x; if (x > maxX) maxX = x;
+        if (y < minY) minY = y; if (y > maxY) maxY = y;
+        if (Math.min(x, W - 1 - x, y, H - 1 - y) < 4) edgeBand++; else interior++;
+        grid[Math.floor(y * G / H)][Math.floor(x * G / W)]++;
+      }
+    }
+    return { step, count, bbox: count ? [minX, minY, maxX, maxY] : null, edgeBand, interior, grid };
+  }
+
   window.__AMR = {
     setLive: (v) => { liveMode = !!v; },
     isLive: () => liveMode,
     reset: resetSim,
     getCardState,
+    nanMap,
     checkPool,
     health,
     getStep: () => step,
@@ -1154,8 +1185,10 @@ async function init() {
           traceDone = true;
           clearInterval(traceTimer);
           const tail = traceLog.slice(-40);
-          console.warn('[amr-spike] TRACE first NaN at step', c.step, '-- copy the JSON below:');
+          const map = await nanMap();
+          console.warn('[amr-spike] TRACE first NaN at step', c.step, '-- copy BOTH JSON lines below:');
           console.log('AMR_TRACE_JSON ' + JSON.stringify(tail));
+          console.log('AMR_NANMAP_JSON ' + JSON.stringify(map));
         }
       } catch (e) { /* readback can race a lost device; ignore */ }
     }, 50);
