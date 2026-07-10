@@ -296,6 +296,15 @@ async function init() {
   device.queue.writeBuffer(cardStateBuf, 0, initCardState());
   device.queue.writeBuffer(f_a, 0, initF());
   device.queue.writeBuffer(finePoolF_a, 0, initFPool());
+  // [intel-xe spike] f_b (the other ping-pong buffer) is never initialized in
+  // the base code -- WebGPU is supposed to zero-init it, but the res>=256 NaN
+  // seeds in exactly f_b's corner cells with a canonical NaN, so test whether
+  // this GPU actually zero-inits it. ?initFB=1 seeds f_b with equilibrium too.
+  if (urlParams.get('initFB') === '1') {
+    device.queue.writeBuffer(f_b, 0, initF());
+    device.queue.writeBuffer(finePoolF_b, 0, initFPool());
+    console.log('[amr-spike] initFB=1: f_b + finePoolF_b seeded with equilibrium');
+  }
   device.queue.writeBuffer(blockSlotBuf, 0, new Int32Array(NBLOCKS).fill(-1));
   device.queue.writeBuffer(slotToBlockBuf, 0, new Int32Array(MAX_FINE_BLOCKS).fill(-1));
   device.queue.writeBuffer(freeListBuf, 0, new Int32Array(MAX_FINE_BLOCKS).map((_, i) => i));
